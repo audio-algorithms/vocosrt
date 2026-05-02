@@ -84,7 +84,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q --strict-markers --strict-config"
+# Default suite skips ``long`` markers (1-hour streams, leak soaks). Run those
+# explicitly with ``pytest -m long``.
+addopts = "-ra -q --strict-markers --strict-config -m 'not long'"
 markers = [
     "slow: tests taking > 30 s",
     "long: tests taking > 5 min (long-run stability, RTF, leak)",
