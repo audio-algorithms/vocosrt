@@ -91,31 +91,49 @@ class OfflineVocos(nn.Module):
         return 1 + (1 + len(self.blocks)) * 6
 
     def forward(self, mel: Tensor) -> Tensor:
-        """Full-sequence causal forward. (B, input_channels, T) -> (B, T*hop_length)."""
+        """Full-sequence causal forward. (B, input_channels, T) -> (B, T*hop_length).
+
+        With gradient checkpointing on the 8 ConvNeXt blocks during training to
+        halve activation memory (D18 agent fix). Checkpointing is enabled iff
+        the module is in train() mode AND the input requires grad somewhere
+        downstream (we infer this from torch.is_grad_enabled()).
+        """
+        from torch.utils.checkpoint import checkpoint
         if mel.dim() != 3 or mel.shape[1] != self.input_channels:
             raise ValueError(
                 f"expected (B, {self.input_channels}, T), got {tuple(mel.shape)}"
             )
+        use_ckpt = self.training and torch.is_grad_enabled()
         # Embed (causal): (B, 100, T) -> (B, 512, T)
         x = self.embed.forward_offline(mel)
         # Per-frame LayerNorm
         x = x.transpose(1, 2)  # (B, T, 512)
         x = self.input_norm(x)
         x = x.transpose(1, 2)
-        # ConvNeXt blocks
+        # ConvNeXt blocks (checkpointed during training to halve activation memory)
         for blk in self.blocks:
-            x = blk.forward_offline(x)
+            if use_ckpt:
+                x = checkpoint(blk.forward_offline, x, use_reentrant=False)
+            else:
+                x = blk.forward_offline(x)
         # Final norm
         x = x.transpose(1, 2)
         x = self.final_layer_norm(x)
         # Head Linear: (B, T, dim) -> (B, T, n_fft+2)
         x = self.head_out(x)
         x = x.transpose(1, 2)  # (B, n_fft+2, T)
-        mag, p = x.chunk(2, dim=1)
-        mag = torch.exp(mag).clamp(max=1e2)
-        S = mag * (torch.cos(p) + 1j * torch.sin(p))  # (B, n_freq, T) complex
-        # ISTFT (full sequence)
-        return self._istft_full(S)
+        # Force the magnitude/phase chain + ISTFT to fp32 even under autocast.
+        # bf16 mag = exp(mag).clamp(max=1e2) is dangerously imprecise (7-bit
+        # mantissa); fp32 here costs ~5 MB of extra activations and removes a
+        # likely contributor to weight drift / hop-aligned transients (D18 agent
+        # hypothesis (b)).
+        with torch.amp.autocast("cuda", enabled=False):
+            x32 = x.float()
+            mag, p = x32.chunk(2, dim=1)
+            mag = torch.exp(mag).clamp(max=1e2)
+            S = mag * (torch.cos(p) + 1j * torch.sin(p))  # (B, n_freq, T) complex
+            audio = self._istft_full(S)
+        return audio
 
     def _istft_full(self, spec: Tensor) -> Tensor:
         """OLA-add T frames into a single audio signal of length T*hop_length.

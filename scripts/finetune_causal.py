@@ -31,12 +31,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+# Per adversarial agent's advice: expandable CUDA allocator helps fragmentation
+# OOMs that empty_cache() can only mask. Set BEFORE torch import.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import soundfile as sf
 import torch
@@ -406,12 +411,24 @@ def main() -> int:
         # batch: (B, T) audio
         audio = batch.to(device, non_blocking=True)
 
-        # Extract mel (frozen)
-        with torch.inference_mode():
+        # Extract mel (frozen). torch.no_grad (not inference_mode) so the resulting
+        # tensor is a normal autograd-eligible tensor without needing .clone().
+        with torch.no_grad():
             mel = mel_extractor(audio)
-        mel = mel.detach().clone()  # detach from inference_mode so backward works
 
         disc_active = cfg.use_discriminators and step >= cfg.disc_warmup_steps
+
+        # Disc-input crop budget (D18 fix per agent): MPD on full segment is the
+        # peak-memory hot spot. Crop to <=8192 samples for both real and fake.
+        DISC_MAX_SAMPLES = 8192
+
+        def _crop_for_disc(real: Tensor, fake: Tensor) -> tuple[Tensor, Tensor]:
+            n_d = min(real.shape[-1], fake.shape[-1])
+            if n_d <= DISC_MAX_SAMPLES:
+                return real[..., :n_d], fake[..., :n_d]
+            start = (n_d - DISC_MAX_SAMPLES) // 2  # center crop is deterministic
+            stop = start + DISC_MAX_SAMPLES
+            return real[..., start:stop], fake[..., start:stop]
 
         # ============= Discriminator step (skipped during disc warmup) =============
         if disc_active:
@@ -420,9 +437,7 @@ def main() -> int:
             with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                     audio_hat_detached = generator(mel).detach()
-                n_d = min(audio.shape[-1], audio_hat_detached.shape[-1])
-                audio_for_d = audio[..., :n_d]
-                audio_hat_d = audio_hat_detached[..., :n_d]
+                audio_for_d, audio_hat_d = _crop_for_disc(audio, audio_hat_detached)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 real_mp, fake_mp, _, _ = mpd(audio_for_d, audio_hat_d)
                 real_mrd, fake_mrd, _, _ = mrd(audio_for_d, audio_hat_d)
@@ -471,8 +486,10 @@ def main() -> int:
             if disc_active:
                 assert mpd is not None and mrd is not None
                 assert gen_adv_loss_fn is not None and fm_loss_fn is not None
-                _, fake_mp_g, fmap_r_mp, fmap_g_mp = mpd(audio, audio_hat)
-                _, fake_mrd_g, fmap_r_mrd, fmap_g_mrd = mrd(audio, audio_hat)
+                # Crop disc inputs to relieve peak memory (D18 fix per agent)
+                audio_d_g, audio_hat_d_g = _crop_for_disc(audio, audio_hat)
+                _, fake_mp_g, fmap_r_mp, fmap_g_mp = mpd(audio_d_g, audio_hat_d_g)
+                _, fake_mrd_g, fmap_r_mrd, fmap_g_mrd = mrd(audio_d_g, audio_hat_d_g)
                 loss_adv_mp, list_adv_mp = gen_adv_loss_fn(fake_mp_g)
                 loss_adv_mrd, list_adv_mrd = gen_adv_loss_fn(fake_mrd_g)
                 loss_adv_mp = loss_adv_mp / max(len(list_adv_mp), 1)
@@ -497,6 +514,9 @@ def main() -> int:
         else:
             loss_for_backward.backward()
         accum_count += 1
+
+        # NB (D18 agent fix): empty_cache() removed. With expandable_segments:True
+        # the allocator manages its own bookkeeping and empty_cache fights it.
 
         if accum_count >= cfg.grad_accum_steps:
             # Gradient clip

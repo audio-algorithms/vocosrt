@@ -146,12 +146,16 @@ class StreamingVocos(nn.Module):
         x = self.head_out(x)
         # Reshape to (B, n_fft+2, 1) and split mag/phase
         x = x.transpose(1, 2)
-        mag, p = x.chunk(2, dim=1)              # each (B, n_fft//2+1, 1)
-        mag = torch.exp(mag).clamp(max=1e2)
-        S = mag * (torch.cos(p) + 1j * torch.sin(p))   # (B, n_fft//2+1, 1) complex
-        spectral_frame = S.squeeze(-1)           # (B, n_fft//2+1) complex
-        # Streaming ISTFT -> hop samples
-        audio = self.istft.step(spectral_frame)
+        # Force the magnitude/phase chain + ISTFT to fp32. bf16 mag = exp(mag)
+        # is dangerously imprecise (7-bit mantissa); fp32 here matches the
+        # offline path exactly (D18 agent hypothesis (b)).
+        with torch.amp.autocast("cuda", enabled=False):
+            x32 = x.float()
+            mag, p = x32.chunk(2, dim=1)
+            mag = torch.exp(mag).clamp(max=1e2)
+            S = mag * (torch.cos(p) + 1j * torch.sin(p))
+            spectral_frame = S.squeeze(-1)
+            audio = self.istft.step(spectral_frame)
         return audio
 
     @torch.inference_mode()
