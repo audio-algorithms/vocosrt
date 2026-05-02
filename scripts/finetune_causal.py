@@ -156,14 +156,17 @@ class TrainConfig:
     lr_initial: float = 1e-4
     lr_final: float = 1e-5
     weight_decay: float = 0.01
-    mel_loss_weight: float = 15.0
-    stft_loss_weight: float = 2.5
-    # Click-targeted losses (D17): wav_l2 penalizes outlier samples quadratically;
-    # diff_match aligns the model's first-derivative envelope to the target's,
-    # directly preventing sharper-than-natural transients (clicks).
-    waveform_l2_weight: float = 1000.0     # MSE; smoke test shows raw value ~0.005 -> contribution ~5 (mel contribution ~6)
-    diff_match_weight: float = 500.0       # first-difference L1 -- raw ~0.005 -> contribution ~2.5
-    use_discriminators: bool = False       # DECISIONS.md D15
+    # Loss weights -- different defaults for GAN vs reconstruction-only training.
+    # When use_discriminators=True, follow upstream Vocos's recipe: mel=45 + adv + fm.
+    # When False, use D17-era reconstruction-only fallback weights.
+    mel_loss_weight: float = 45.0          # upstream default for GAN training
+    stft_loss_weight: float = 0.0          # disabled when GAN is active (adv handles spectrum)
+    waveform_l2_weight: float = 0.0        # disabled when GAN is active
+    diff_match_weight: float = 0.0         # disabled when GAN is active
+    mrd_loss_coeff: float = 1.0            # upstream default
+    use_discriminators: bool = False       # see DECISIONS.md D18
+    disc_warmup_steps: int = 2_000         # train mel-only for first N steps; then enable disc
+    grad_checkpoint_generator: bool = True # save activation memory at the cost of recompute
     precision: str = "bf16"                # "fp32" / "fp16" / "bf16"
     checkpoint_every: int = 2_500
     validate_every: int = 2_500
@@ -233,6 +236,13 @@ def main() -> int:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--use-discriminators", action="store_true")
+    parser.add_argument("--disc-warmup-steps", type=int, default=2_000,
+                        help="Train mel-only for N steps before enabling discriminators (avoids early instability)")
+    parser.add_argument("--mel-loss-weight", type=float, default=45.0)
+    parser.add_argument("--stft-loss-weight", type=float, default=0.0)
+    parser.add_argument("--waveform-l2-weight", type=float, default=0.0)
+    parser.add_argument("--diff-match-weight", type=float, default=0.0)
+    parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wall-clock-budget-h", type=float, default=60.0)
     parser.add_argument("--smoke-test", action="store_true",
@@ -248,6 +258,12 @@ def main() -> int:
         lr_final=args.lr_final,
         precision=args.precision,
         use_discriminators=args.use_discriminators,
+        disc_warmup_steps=args.disc_warmup_steps,
+        mel_loss_weight=args.mel_loss_weight,
+        stft_loss_weight=args.stft_loss_weight,
+        waveform_l2_weight=args.waveform_l2_weight,
+        diff_match_weight=args.diff_match_weight,
+        mrd_loss_coeff=args.mrd_loss_coeff,
         checkpoint_every=args.checkpoint_every,
         validate_every=args.validate_every,
         sample_every=args.sample_every,
@@ -256,9 +272,6 @@ def main() -> int:
         seed=args.seed,
         wall_clock_budget_h=args.wall_clock_budget_h,
     )
-    if cfg.use_discriminators:
-        log.error("--use-discriminators is not yet implemented; ignoring (per DECISIONS.md D15)")
-        cfg.use_discriminators = False
 
     log.info("vocos_rt fine-tune starting; config=%s", json.dumps(asdict(cfg), indent=2))
 
@@ -305,13 +318,40 @@ def main() -> int:
         p.requires_grad_(False)
 
     # ---- losses ----
-    from vocos.loss import MelSpecReconstructionLoss
+    from vocos.loss import (
+        DiscriminatorLoss, FeatureMatchingLoss, GeneratorLoss, MelSpecReconstructionLoss,
+    )
     mel_loss_fn = MelSpecReconstructionLoss(
         sample_rate=SAMPLE_RATE, n_fft=1024, hop_length=256, n_mels=100,
     ).to(device)
     stft_loss_fn = MultiResolutionSTFTLoss().to(device)
 
-    # ---- optimizer + scheduler ----
+    # ---- discriminators (D18) ----
+    mpd = mrd = disc_loss_fn = gen_adv_loss_fn = fm_loss_fn = None
+    optimizer_disc = scheduler_disc = None
+    if cfg.use_discriminators:
+        from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
+        log.info("constructing MPD + MRD discriminators ...")
+        mpd = MultiPeriodDiscriminator().to(device)
+        mrd = MultiResolutionDiscriminator().to(device)
+        mpd.train()
+        mrd.train()
+        n_mpd = sum(p.numel() for p in mpd.parameters())
+        n_mrd = sum(p.numel() for p in mrd.parameters())
+        log.info("MPD params: %d (%.1f MB FP32); MRD params: %d (%.1f MB FP32); total disc: %.1f MB",
+                 n_mpd, n_mpd * 4 / 1e6, n_mrd, n_mrd * 4 / 1e6, (n_mpd + n_mrd) * 4 / 1e6)
+        disc_loss_fn = DiscriminatorLoss().to(device)
+        gen_adv_loss_fn = GeneratorLoss().to(device)
+        fm_loss_fn = FeatureMatchingLoss().to(device)
+        optimizer_disc = torch.optim.AdamW(
+            list(mpd.parameters()) + list(mrd.parameters()),
+            lr=cfg.lr_initial, weight_decay=cfg.weight_decay, betas=(0.8, 0.99),
+        )
+        scheduler_disc = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_disc, T_max=cfg.num_steps, eta_min=cfg.lr_final,
+        )
+
+    # ---- optimizer + scheduler (generator) ----
     optimizer = make_optimizer(generator, cfg)
     scheduler = make_scheduler(optimizer, cfg)
 
@@ -355,7 +395,7 @@ def main() -> int:
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_count = 0
-    last_log_loss = {"mel": 0.0, "stft": 0.0, "wav_l2": 0.0, "diff": 0.0, "total": 0.0}
+    last_log_loss: dict[str, float] = {"mel": 0.0, "total": 0.0}
 
     while step < cfg.num_steps:
         try:
@@ -371,28 +411,84 @@ def main() -> int:
             mel = mel_extractor(audio)
         mel = mel.detach().clone()  # detach from inference_mode so backward works
 
-        # Forward generator
+        disc_active = cfg.use_discriminators and step >= cfg.disc_warmup_steps
+
+        # ============= Discriminator step (skipped during disc warmup) =============
+        if disc_active:
+            assert mpd is not None and mrd is not None and disc_loss_fn is not None
+            assert optimizer_disc is not None
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    audio_hat_detached = generator(mel).detach()
+                n_d = min(audio.shape[-1], audio_hat_detached.shape[-1])
+                audio_for_d = audio[..., :n_d]
+                audio_hat_d = audio_hat_detached[..., :n_d]
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                real_mp, fake_mp, _, _ = mpd(audio_for_d, audio_hat_d)
+                real_mrd, fake_mrd, _, _ = mrd(audio_for_d, audio_hat_d)
+                loss_d_mp, _, _ = disc_loss_fn(real_mp, fake_mp)
+                loss_d_mrd, _, _ = disc_loss_fn(real_mrd, fake_mrd)
+                loss_d = (loss_d_mp / max(len(real_mp), 1) +
+                          cfg.mrd_loss_coeff * loss_d_mrd / max(len(real_mrd), 1))
+            optimizer_disc.zero_grad(set_to_none=True)
+            if use_scaler:
+                scaler.scale(loss_d).backward()
+                scaler.unscale_(optimizer_disc)
+                torch.nn.utils.clip_grad_norm_(
+                    list(mpd.parameters()) + list(mrd.parameters()), cfg.grad_clip)
+                scaler.step(optimizer_disc)
+            else:
+                loss_d.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(mpd.parameters()) + list(mrd.parameters()), cfg.grad_clip)
+                optimizer_disc.step()
+            assert scheduler_disc is not None
+            scheduler_disc.step()
+            last_log_loss["d_mp"] = float(loss_d_mp.detach())
+            last_log_loss["d_mrd"] = float(loss_d_mrd.detach())
+            del audio_hat_detached, audio_hat_d, audio_for_d, real_mp, fake_mp, real_mrd, fake_mrd
+
+        # ============= Generator step =============
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             audio_hat = generator(mel)
-            # Match length (offline forward returns T*hop samples; trim audio to match)
             n = min(audio.shape[-1], audio_hat.shape[-1])
             audio = audio[..., :n]
             audio_hat = audio_hat[..., :n]
 
             mel_loss = mel_loss_fn(audio_hat, audio)
-            stft_loss = stft_loss_fn(audio, audio_hat)
-            # Waveform L2 -- penalize large per-sample errors quadratically
-            wav_l2 = (audio - audio_hat).pow(2).mean()
-            # First-difference matching -- model's d/dt should match target's d/dt;
-            # mismatch here is exactly what produces audible clicks
-            target_diff = audio[..., 1:] - audio[..., :-1]
-            output_diff = audio_hat[..., 1:] - audio_hat[..., :-1]
-            diff_match = (target_diff - output_diff).abs().mean()
+
+            # Optional reconstruction terms (D17 fallbacks; default 0 with GAN)
+            stft_loss = stft_loss_fn(audio, audio_hat) if cfg.stft_loss_weight > 0 else torch.zeros((), device=device)
+            wav_l2 = (audio - audio_hat).pow(2).mean() if cfg.waveform_l2_weight > 0 else torch.zeros((), device=device)
+            if cfg.diff_match_weight > 0:
+                target_diff = audio[..., 1:] - audio[..., :-1]
+                output_diff = audio_hat[..., 1:] - audio_hat[..., :-1]
+                diff_match = (target_diff - output_diff).abs().mean()
+            else:
+                diff_match = torch.zeros((), device=device)
+
+            # Adversarial + feature matching (when disc active)
+            if disc_active:
+                assert mpd is not None and mrd is not None
+                assert gen_adv_loss_fn is not None and fm_loss_fn is not None
+                _, fake_mp_g, fmap_r_mp, fmap_g_mp = mpd(audio, audio_hat)
+                _, fake_mrd_g, fmap_r_mrd, fmap_g_mrd = mrd(audio, audio_hat)
+                loss_adv_mp, list_adv_mp = gen_adv_loss_fn(fake_mp_g)
+                loss_adv_mrd, list_adv_mrd = gen_adv_loss_fn(fake_mrd_g)
+                loss_adv_mp = loss_adv_mp / max(len(list_adv_mp), 1)
+                loss_adv_mrd = loss_adv_mrd / max(len(list_adv_mrd), 1)
+                loss_fm_mp = fm_loss_fn(fmap_r_mp, fmap_g_mp) / max(len(fmap_r_mp), 1)
+                loss_fm_mrd = fm_loss_fn(fmap_r_mrd, fmap_g_mrd) / max(len(fmap_r_mrd), 1)
+            else:
+                loss_adv_mp = loss_adv_mrd = loss_fm_mp = loss_fm_mrd = torch.zeros((), device=device)
+
             total_loss = (
                 cfg.mel_loss_weight * mel_loss
                 + cfg.stft_loss_weight * stft_loss
                 + cfg.waveform_l2_weight * wav_l2
                 + cfg.diff_match_weight * diff_match
+                + loss_adv_mp + cfg.mrd_loss_coeff * loss_adv_mrd
+                + loss_fm_mp + cfg.mrd_loss_coeff * loss_fm_mrd
             )
             loss_for_backward = total_loss / cfg.grad_accum_steps
 
@@ -418,22 +514,33 @@ def main() -> int:
             step += 1
 
             last_log_loss["mel"] = float(mel_loss.detach())
-            last_log_loss["stft"] = float(stft_loss.detach())
-            last_log_loss["wav_l2"] = float(wav_l2.detach())
-            last_log_loss["diff"] = float(diff_match.detach())
             last_log_loss["total"] = float(total_loss.detach())
+            if disc_active:
+                last_log_loss["adv_mp"] = float(loss_adv_mp.detach())
+                last_log_loss["adv_mrd"] = float(loss_adv_mrd.detach())
+                last_log_loss["fm_mp"] = float(loss_fm_mp.detach())
+                last_log_loss["fm_mrd"] = float(loss_fm_mrd.detach())
 
             if step % cfg.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 wall = time.time() - t_start
                 steps_per_s = (step - start_step) / max(wall, 1e-3)
                 eta_h = (cfg.num_steps - step) / max(steps_per_s, 1e-3) / 3600.0
-                log.info(
-                    "step=%d/%d lr=%.2e mel=%.4f stft=%.4f wav2=%.5f diff=%.5f total=%.4f sps=%.2f eta_h=%.1f",
-                    step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["stft"],
-                    last_log_loss["wav_l2"], last_log_loss["diff"],
-                    last_log_loss["total"], steps_per_s, eta_h,
-                )
+                if disc_active:
+                    log.info(
+                        "step=%d/%d lr=%.2e mel=%.4f advMP=%.3f advMR=%.3f fmMP=%.3f fmMR=%.3f dMP=%.3f dMR=%.3f total=%.2f sps=%.2f eta_h=%.1f",
+                        step, cfg.num_steps, lr, last_log_loss["mel"],
+                        last_log_loss.get("adv_mp", 0), last_log_loss.get("adv_mrd", 0),
+                        last_log_loss.get("fm_mp", 0), last_log_loss.get("fm_mrd", 0),
+                        last_log_loss.get("d_mp", 0), last_log_loss.get("d_mrd", 0),
+                        last_log_loss["total"], steps_per_s, eta_h,
+                    )
+                else:
+                    log.info(
+                        "step=%d/%d lr=%.2e mel=%.4f total=%.4f (mel-warmup) sps=%.2f eta_h=%.1f",
+                        step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["total"],
+                        steps_per_s, eta_h,
+                    )
 
             # Wall-clock budget check at regular intervals (after warmup so sps is stable)
             if step == 200:
@@ -484,9 +591,8 @@ def main() -> int:
         completion_marker.write_text(f"completed at step {step}\n")
 
     total_h = (time.time() - t_start) / 3600.0
-    log.info("DONE. wall-clock=%.2f h, final losses: mel=%.4f stft=%.4f wav_l2=%.5f diff=%.5f",
-             total_h, last_log_loss["mel"], last_log_loss["stft"],
-             last_log_loss["wav_l2"], last_log_loss["diff"])
+    log.info("DONE. wall-clock=%.2f h, final mel=%.4f total=%.4f",
+             total_h, last_log_loss["mel"], last_log_loss["total"])
     return 0
 
 

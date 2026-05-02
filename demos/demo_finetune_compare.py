@@ -36,7 +36,7 @@ from vocos_rt.streaming_vocos import StreamingVocos  # noqa: E402
 WORKSPACE = Path(r"C:\Users\jakob\Desktop\google drive\VOCOSRT")
 INPUT_DIR = WORKSPACE / "audio"
 OUTPUT_DIR = WORKSPACE / "audio_out_finetune"
-FINETUNE_CHECKPOINT = REPO_ROOT / "checkpoints" / "finetune" / "final.pt"
+FINETUNE_CHECKPOINT = REPO_ROOT / "checkpoints" / "finetune" / "step_035000.pt"  # D17 best (training crashed before step 50k)
 SAMPLE_RATE = 24_000
 SKIP_NON_SPEECH = {"noise.wav", "music.wav", "keyboard.wav"}
 WARMUP_SKIP = SAMPLE_RATE // 10  # 100 ms

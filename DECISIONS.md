@@ -103,6 +103,22 @@ Every non-trivial deviation from `prompt/CLAUDE_CODE_PROMPT_VOCOS_REALTIME.md`, 
 **Rationale:** Autonomous build cannot guarantee a microphone is present; synthetic-mel + virtual-loopback gives a deterministic, headless-runnable verdict. The four bundled WAVs (keyboard, music, noise, speech) are convenient diverse inputs.
 **Worth Jakob reviewing first?** No.
 
+## D18  Add MPD + MRD discriminators (revisit D15); D17 reconstruction-only also distorted    [decided 2026-05-02]
+**Source:** Jakob's listening of D17 ("Neither C nor D is acceptable. They both suffer from distortion."); also gave explicit instruction to add discriminators.
+**Why this reverses D15:** D15 deferred discriminators because of 4 GB memory analysis. After actually measuring: MPD = 164 MB params, MRD = 5.7 MB params (NOT the 30+30 I'd guessed). With AdamW state and bf16 activations at batch=1 segment=16384, the full GAN training fits in 4 GB (smoke test verified, no OOM in 100 steps).
+**Decision:**
+1. Add `MultiPeriodDiscriminator` and `MultiResolutionDiscriminator` from `vocos.discriminators`.
+2. Two-optimizer alternating training (upstream Vocos pattern):
+   - Discriminator step: forward generator no-grad, then forward both discs on (real, fake), compute hinge disc loss, backprop into discs only.
+   - Generator step: forward generator with grad, forward both discs to get adversarial+feature-matching losses, backprop into generator with mel + adv + fm.
+3. **Revert to upstream's loss recipe**: `mel*45 + adv_mp + adv_mrd + fm_mp + fm_mrd`. Drop my D17 reconstruction additions (waveform_l2, diff_match) when discriminators are active -- they were workarounds for the lack of GAN supervision.
+4. Memory-fit knobs: batch_size=1, segment_samples=16384 (~0.7s; was 32768), bf16 throughout.
+5. `--disc-warmup-steps 2000`: train mel-only for first 2k steps before enabling discriminators (avoid early instability when discs are random).
+**Companion deliverable per Jakob's instruction:** `tests/test_06_distortion_metrics.py` + `vocos_rt/distortion_metrics.py` give us programmatic distortion gates (clicks/pops/spectral/crest-factor). Calibrated against upstream-gold and pretrained-streaming baselines so any future fine-tune can be evaluated objectively without listening tests.
+**Time budget:** smoke test shows 2.7 sps; 50k steps projected ~5h.
+**Reversibility:** trivial -- run without `--use-discriminators` to revert to D17-style training.
+**Worth Jakob reviewing first?** Already greenlit explicitly.
+
 ## D17  D16 didn't fix clicks; switch to waveform L2 + first-difference matching loss     [decided 2026-05-02]
 **Source:** Jakob's post-D16 listening report ("I still hear clicks") + diagnostic numbers (D16 max sample jump = 0.665, WORSE than D15's 0.453).
 **Why D16 failed:** Waveform L1 minimizes the AVERAGE absolute error, not the MAXIMUM. The model can satisfy a low average by keeping most samples close to target while letting a few samples spike high. Counterintuitively, the L1 fix made max_jump worse because the optimizer had a bigger gradient pull toward minimizing 5,000 small errors than minimizing 50 catastrophic ones.
