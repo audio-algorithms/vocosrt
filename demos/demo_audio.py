@@ -49,10 +49,17 @@ def load_mono_24k(path: Path) -> torch.Tensor:
     return audio.to(torch.float32)
 
 
-def peak_normalize_to(reference: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Scale ``target`` so its peak equals ``reference``'s peak."""
+def peak_normalize_to(reference: torch.Tensor, target: torch.Tensor,
+                      skip_samples: int = 0) -> torch.Tensor:
+    """Scale ``target`` so its peak equals ``reference``'s peak.
+
+    ``skip_samples`` excludes the leading region from the peak estimate -- used
+    to avoid being dominated by streaming warmup transients that would crush
+    the steady-state body to near-silence.
+    """
     ref_peak = float(reference.abs().max())
-    tgt_peak = float(target.abs().max())
+    body = target[..., skip_samples:] if skip_samples > 0 else target
+    tgt_peak = float(body.abs().max())
     if tgt_peak < 1e-9 or ref_peak < 1e-9:
         return target
     return target * (ref_peak / tgt_peak)
@@ -71,10 +78,19 @@ def main() -> int:
     if not INPUT_DIR.exists():
         print(f"[demo_audio] ERROR: input dir not found: {INPUT_DIR}", file=sys.stderr)
         return 1
-    inputs = sorted(INPUT_DIR.glob("*.wav"))
+
+    # Per Jakob 2026-05-01: vocos-mel-24khz is a speech-trained model, and the
+    # interesting test is on speech inputs. Drop noise / music / keyboard /
+    # the original speech.wav stress sample, keep all the TTS speech samples
+    # plus a short curated subset for variety.
+    EXCLUDE = {"noise.wav", "music.wav", "keyboard.wav"}
+    all_wavs = sorted(INPUT_DIR.glob("*.wav"))
+    inputs = [p for p in all_wavs if p.name not in EXCLUDE]
     if not inputs:
-        print(f"[demo_audio] ERROR: no .wav files under {INPUT_DIR}", file=sys.stderr)
+        print(f"[demo_audio] ERROR: no eligible .wav files under {INPUT_DIR}", file=sys.stderr)
         return 1
+    if len(all_wavs) > len(inputs):
+        print(f"[demo_audio] Skipping non-speech: {sorted(EXCLUDE & {p.name for p in all_wavs})}")
 
     print(f"[demo_audio] Found {len(inputs)} input WAVs in {INPUT_DIR}")
     print(f"[demo_audio] Outputs will land in {OUTPUT_DIR}")
@@ -114,15 +130,20 @@ def main() -> int:
         # 3a. input (resampled reference)
         save_wav(OUTPUT_DIR / f"{stem}__01_input.wav", audio.cpu(), SAMPLE_RATE)
 
+        # Skip the first 100 ms of any reconstructed signal when peak-normalizing,
+        # so streaming warmup transients can't crush steady-state content to near-silence.
+        warmup_skip = SAMPLE_RATE // 10  # 2400 samples = 100 ms
+
         # 3b. upstream non-causal offline -- gold reference for the vocoder
         t0 = time.time()
         with torch.inference_mode():
             audio_offline = upstream.decode(mel)
         t_offline = time.time() - t0
         rtf_offline = t_offline / n_sec
-        audio_offline = peak_normalize_to(audio, audio_offline)
+        audio_offline = peak_normalize_to(audio, audio_offline, skip_samples=warmup_skip)
         save_wav(OUTPUT_DIR / f"{stem}__02_offline_noncausal.wav", audio_offline.cpu(), SAMPLE_RATE)
-        print(f"  offline non-causal upstream:  {t_offline*1000:.0f} ms  RTF={rtf_offline:.3f}")
+        print(f"  offline non-causal upstream:  {t_offline*1000:.0f} ms  RTF={rtf_offline:.3f}  "
+              f"peak={float(audio_offline.abs().max()):.3f}")
 
         # 3c. streaming causal (as-is weights)
         streaming.reset(batch_size=1)
@@ -130,9 +151,13 @@ def main() -> int:
         audio_streaming = streaming.stream(mel)
         t_streaming = time.time() - t0
         rtf_streaming = t_streaming / n_sec
-        audio_streaming = peak_normalize_to(audio, audio_streaming)
+        # Diagnostic: report raw peak BEFORE normalization to surface any spike issues
+        raw_peak = float(audio_streaming.abs().max())
+        body_peak = float(audio_streaming[..., warmup_skip:].abs().max())
+        audio_streaming = peak_normalize_to(audio, audio_streaming, skip_samples=warmup_skip)
         save_wav(OUTPUT_DIR / f"{stem}__03_streaming_causal.wav", audio_streaming.cpu(), SAMPLE_RATE)
-        print(f"  streaming causal vocos_rt:    {t_streaming*1000:.0f} ms  RTF={rtf_streaming:.3f}")
+        print(f"  streaming causal vocos_rt:    {t_streaming*1000:.0f} ms  RTF={rtf_streaming:.3f}  "
+              f"raw_peak={raw_peak:.3f}  body_peak={body_peak:.3f}")
         print()
 
     print(f"[demo_audio] DONE. {len(inputs)} inputs * 3 variants = {len(inputs)*3} files in {OUTPUT_DIR}")

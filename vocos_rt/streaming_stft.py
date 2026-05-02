@@ -87,10 +87,23 @@ class StreamingISTFT(nn.Module):
         self.register_buffer("window", window, persistent=False)
         self.register_buffer("window_sq", window.square(), persistent=False)
 
+        # Steady-state envelope: sum of window^2 over n_overlap = n_fft//hop
+        # contributions. For Hann + 75% overlap this is exactly 1.5 (constant).
+        # We use this constant for OLA normalization instead of the running env
+        # so the warmup region produces a gentle fade-in rather than huge spikes
+        # at sample positions where the running env is near-zero.
+        n_overlap = n_fft // hop_length
+        steady = torch.zeros(hop_length, device=device, dtype=dtype)
+        for i in range(hop_length):
+            for k in range(n_overlap):
+                idx = i + k * hop_length
+                if idx < n_fft:
+                    steady[i] = steady[i] + window[idx] ** 2
+        self.register_buffer("steady_env", steady, persistent=False)
+
         # Per-stream state -- NOT registered as buffers so they don't leak into state_dict.
         # Initialized lazily in reset(), since batch size is not known at construction.
         self._accum: Tensor | None = None
-        self._env: Tensor | None = None
         self._n_frames: int = 0
         self._dtype = dtype
 
@@ -100,7 +113,6 @@ class StreamingISTFT(nn.Module):
         """Clear the per-stream state. Call before the first ``step`` of a new stream."""
         device = self.window.device
         self._accum = torch.zeros(batch_size, self.n_fft, device=device, dtype=self._dtype)
-        self._env = torch.zeros(self.n_fft, device=device, dtype=self._dtype)
         self._n_frames = 0
 
     @property
@@ -130,7 +142,7 @@ class StreamingISTFT(nn.Module):
         if self._accum is None:
             self.reset(batch_size=frame.shape[0])
         # Type narrowing for the static checker
-        assert self._accum is not None and self._env is not None
+        assert self._accum is not None
 
         if frame.shape[0] != self._accum.shape[0]:
             raise ValueError(
@@ -147,26 +159,19 @@ class StreamingISTFT(nn.Module):
         time_domain = torch.fft.irfft(frame, n=self.n_fft, dim=-1, norm="backward")
         time_domain = time_domain * self.window  # broadcasts over batch dim
 
-        # 2. Add to accumulators
+        # 2. Add to accumulator
         self._accum = self._accum + time_domain
-        self._env = self._env + self.window_sq
         self._n_frames += 1
 
-        # 3. Emit leftmost hop samples (envelope-normalized)
-        # Floor on envelope to handle the very-near-zero hann window samples at the
-        # start of stream; the corresponding samples in _accum are also near-zero so
-        # the result is dominated by the floor only at a few boundary samples.
-        emit_env = self._env[: self.hop_length].clamp(min=1e-11)
-        emit = self._accum[:, : self.hop_length] / emit_env
+        # 3. Emit leftmost hop samples (steady-state envelope normalization).
+        # The steady-state env is a constant (1.5 for Hann + 75% overlap) so the
+        # warmup region naturally fades in rather than spiking at near-zero env.
+        emit = self._accum[:, : self.hop_length] / self.steady_env
 
         # 4. Shift left by hop, zero-fill rightmost hop positions
         new_accum = torch.zeros_like(self._accum)
         new_accum[:, : -self.hop_length] = self._accum[:, self.hop_length :]
         self._accum = new_accum
-
-        new_env = torch.zeros_like(self._env)
-        new_env[: -self.hop_length] = self._env[self.hop_length :]
-        self._env = new_env
 
         return emit
 
