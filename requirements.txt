@@ -1,8 +1,17 @@
 # Runtime dependencies. Pinned floor only; let pip resolve compatible upper bounds.
 # See pyproject.toml for the canonical declaration; this file exists for setup.bat / setup.sh consumption.
+#
+# IMPORTANT (DECISIONS.md D13): torch must be installed from the PyTorch CUDA
+# wheel index, not PyPI. PyPI ships only CPU wheels. setup.bat/setup.sh install
+# torch separately with the cu121 index BEFORE this requirements file. If you
+# install this file directly with `pip install -r`, do it as:
+#
+#     pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+#
+# to get GPU torch. Otherwise tests 16/17a and Phase 2 fine-tune cannot run.
 
 torch>=2.2
-numpy>=1.26
+numpy>=1.26,<2.0   # numpy 2.x breaks several audio deps (librosa, torchcrepe) -- pin <2 until ecosystem catches up
 scipy>=1.11
 vocos>=0.1.0
 onnxruntime-gpu>=1.17

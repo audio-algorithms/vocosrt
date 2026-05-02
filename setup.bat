@@ -79,6 +79,13 @@ set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 REM ---- Phase 3: install deps ----
 echo.
 echo [3/8] Installing dependencies ...
+REM Install torch from the CUDA 12.1 wheel index first (DECISIONS.md D13).
+REM PyPI ships only CPU wheels; we need GPU torch for tests 16/17a and Phase 2.
+if "%HAS_GPU%"=="1" (
+    "%VENV_PY%" -m pip install --index-url https://download.pytorch.org/whl/cu121 torch
+) else (
+    "%VENV_PY%" -m pip install torch
+)
 "%VENV_PY%" -m pip install -r "%REPO_ROOT%requirements.txt"
 if errorlevel 1 (
     echo [setup] ERROR: requirements.txt install failed.

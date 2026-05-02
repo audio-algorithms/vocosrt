@@ -103,6 +103,13 @@ Every non-trivial deviation from `prompt/CLAUDE_CODE_PROMPT_VOCOS_REALTIME.md`, 
 **Rationale:** Autonomous build cannot guarantee a microphone is present; synthetic-mel + virtual-loopback gives a deterministic, headless-runnable verdict. The four bundled WAVs (keyboard, music, noise, speech) are convenient diverse inputs.
 **Worth Jakob reviewing first?** No.
 
+## D13  Install `torch` from the PyTorch CUDA wheel index, not PyPI           [decided 2026-05-01]
+**Source:** discovery (default PyPI install gave us `torch 2.11.0+cpu`; CUDA not visible to torch even though the driver supports it and ONNX Runtime sees both `CUDAExecutionProvider` and `TensorrtExecutionProvider`)
+**Decision:** Install torch with `--index-url https://download.pytorch.org/whl/cu121`. `requirements.txt` notes this with a comment block; `setup.bat`/`setup.sh` install torch separately with the CUDA index URL before the rest of `requirements.txt`.
+**Rationale:** PyTorch ships CPU and CUDA wheels at separate index URLs. PyPI only carries CPU. Tests 16 (RTF deadline) and Phase 2 (fine-tune) need GPU acceleration; CPU torch makes both effectively impossible.
+**Reversibility:** trivial — pip uninstall + reinstall with the other index.
+**Worth Jakob reviewing first?** No.
+
 ## D12  Excluded tests 14, 15, 17b — documented per prompt §7.3           [decided 2026-05-01]
 **Source:** prompt §7.3
 **Decision:** Tests 14 (MUSHRA), 15 (ABX), 17b (acoustic loopback) are excluded. Documented in `parity_report.html`.

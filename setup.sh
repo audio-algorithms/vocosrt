@@ -68,6 +68,13 @@ VENV_PY="${VENV_DIR}/bin/python"
 # ---- Phase 3: install deps ----
 echo
 echo "[3/8] Installing dependencies ..."
+# Install torch from the CUDA 12.1 wheel index first (DECISIONS.md D13).
+# PyPI ships only CPU wheels; we need GPU torch for tests 16/17a and Phase 2.
+if [[ "${HAS_GPU}" == "1" ]]; then
+    "${VENV_PY}" -m pip install --index-url https://download.pytorch.org/whl/cu121 torch
+else
+    "${VENV_PY}" -m pip install torch
+fi
 "${VENV_PY}" -m pip install -r "${REPO_ROOT}/requirements.txt"
 "${VENV_PY}" -m pip install -r "${REPO_ROOT}/requirements-dev.txt"
 "${VENV_PY}" -m pip install -e "${REPO_ROOT}"
