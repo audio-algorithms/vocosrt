@@ -103,11 +103,12 @@ Every non-trivial deviation from `prompt/CLAUDE_CODE_PROMPT_VOCOS_REALTIME.md`, 
 **Rationale:** Autonomous build cannot guarantee a microphone is present; synthetic-mel + virtual-loopback gives a deterministic, headless-runnable verdict. The four bundled WAVs (keyboard, music, noise, speech) are convenient diverse inputs.
 **Worth Jakob reviewing first?** No.
 
-## D13  Install `torch` from the PyTorch CUDA wheel index, not PyPI           [decided 2026-05-01]
+## D13  Install `torch`+`torchaudio` from PyTorch CUDA wheel index; pin to 2.5.1           [decided 2026-05-01]
 **Source:** discovery (default PyPI install gave us `torch 2.11.0+cpu`; CUDA not visible to torch even though the driver supports it and ONNX Runtime sees both `CUDAExecutionProvider` and `TensorrtExecutionProvider`)
-**Decision:** Install torch with `--index-url https://download.pytorch.org/whl/cu121`. `requirements.txt` notes this with a comment block; `setup.bat`/`setup.sh` install torch separately with the CUDA index URL before the rest of `requirements.txt`.
-**Rationale:** PyTorch ships CPU and CUDA wheels at separate index URLs. PyPI only carries CPU. Tests 16 (RTF deadline) and Phase 2 (fine-tune) need GPU acceleration; CPU torch makes both effectively impossible.
-**Reversibility:** trivial — pip uninstall + reinstall with the other index.
+**Decision:** Install both torch and torchaudio from `--index-url https://download.pytorch.org/whl/cu121`, pinned to **2.5.1** (matched ABI). `requirements.txt` pins both. `setup.bat`/`setup.sh` install them together before the rest of `requirements.txt`.
+**Rationale:** (1) PyPI only carries CPU torch. (2) torch and torchaudio share a native ABI — installing torch from the CUDA index without also reinstalling torchaudio leaves a broken installation: `import vocos` (which imports torchaudio) fails with `OSError: [WinError 127] The specified procedure could not be found`. (3) 2.5.1 chosen because it is the latest cu121 wheel that all of torch / torchaudio / onnxruntime-gpu agree on. Tests 16 (RTF deadline) and Phase 2 (fine-tune) require GPU.
+**Verified end-to-end:** `import torch, torchaudio, vocos; vocos.models.VocosBackbone(...).forward(...)` works on RTX 3050 4 GB.
+**Reversibility:** trivial — pip uninstall + reinstall.
 **Worth Jakob reviewing first?** No.
 
 ## D12  Excluded tests 14, 15, 17b — documented per prompt §7.3           [decided 2026-05-01]

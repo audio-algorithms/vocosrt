@@ -10,7 +10,8 @@
 #
 # to get GPU torch. Otherwise tests 16/17a and Phase 2 fine-tune cannot run.
 
-torch>=2.2
+torch==2.5.1       # pinned: matches torchaudio==2.5.1 ABI; cu121 wheel needed for GPU
+torchaudio==2.5.1  # MUST match torch version; ABI tied
 numpy>=1.26,<2.0   # numpy 2.x breaks several audio deps (librosa, torchcrepe) -- pin <2 until ecosystem catches up
 scipy>=1.11
 vocos>=0.1.0

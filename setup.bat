@@ -79,12 +79,14 @@ set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 REM ---- Phase 3: install deps ----
 echo.
 echo [3/8] Installing dependencies ...
-REM Install torch from the CUDA 12.1 wheel index first (DECISIONS.md D13).
+REM Install torch+torchaudio from the CUDA 12.1 wheel index first (DECISIONS.md D13).
 REM PyPI ships only CPU wheels; we need GPU torch for tests 16/17a and Phase 2.
+REM torch and torchaudio MUST be installed together with matching versions or
+REM torchaudio's native extension fails to load (ABI mismatch).
 if "%HAS_GPU%"=="1" (
-    "%VENV_PY%" -m pip install --index-url https://download.pytorch.org/whl/cu121 torch
+    "%VENV_PY%" -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1 torchaudio==2.5.1
 ) else (
-    "%VENV_PY%" -m pip install torch
+    "%VENV_PY%" -m pip install torch==2.5.1 torchaudio==2.5.1
 )
 "%VENV_PY%" -m pip install -r "%REPO_ROOT%requirements.txt"
 if errorlevel 1 (
