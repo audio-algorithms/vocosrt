@@ -37,13 +37,16 @@ reports/test_results/
 reports/parity_report.html
 reports/*.png
 reports/*.json
-demos/assets/
-!reports/.gitkeep
+demos/assets/*
 !demos/assets/.gitkeep
+!reports/.gitkeep
 
 # Tests' downloaded data
-tests/data/
+tests/data/*
 !tests/data/.gitkeep
+
+# Setup completion marker
+.setup_complete
 
 # Logs
 *.log

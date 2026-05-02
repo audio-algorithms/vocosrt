@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Real-time streaming refactor of the Vocos neural vocoder"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-authors = [{ name = "Jakob Ashtar", email = "" }]
+authors = [{ name = "Jakob Ashtar" }]
 license = { text = "Proprietary - Copyright (c) 2026 AudioAlgorithms LLC. All rights reserved." }
 classifiers = [
     "Programming Language :: Python :: 3.12",
