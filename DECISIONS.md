@@ -103,6 +103,17 @@ Every non-trivial deviation from `prompt/CLAUDE_CODE_PROMPT_VOCOS_REALTIME.md`, 
 **Rationale:** Autonomous build cannot guarantee a microphone is present; synthetic-mel + virtual-loopback gives a deterministic, headless-runnable verdict. The four bundled WAVs (keyboard, music, noise, speech) are convenient diverse inputs.
 **Worth Jakob reviewing first?** No.
 
+## D17  D16 didn't fix clicks; switch to waveform L2 + first-difference matching loss     [decided 2026-05-02]
+**Source:** Jakob's post-D16 listening report ("I still hear clicks") + diagnostic numbers (D16 max sample jump = 0.665, WORSE than D15's 0.453).
+**Why D16 failed:** Waveform L1 minimizes the AVERAGE absolute error, not the MAXIMUM. The model can satisfy a low average by keeping most samples close to target while letting a few samples spike high. Counterintuitively, the L1 fix made max_jump worse because the optimizer had a bigger gradient pull toward minimizing 5,000 small errors than minimizing 50 catastrophic ones.
+**D17 decision:**
+1. **Replace waveform L1 with waveform L2 (MSE).** L2 penalizes outliers quadratically: a 0.5 spike costs 100x more than a 0.05 typical error (vs L1 where it costs 10x). The optimizer cannot ignore catastrophic samples under MSE.
+2. **Add first-difference matching loss:** `|(audio_hat[t] - audio_hat[t-1]) - (audio[t] - audio[t-1])|.mean()`. This penalizes the difference between the MODEL's instantaneous derivative and the TARGET's instantaneous derivative. Directly targets the click metric. Won't oversmooth (the target's natural transients are matched, not penalized).
+3. Loss weights set so each term contributes ~similar magnitude: mel*15 + stft*2.5 + wav_l2*100 + diff_match*50.
+**Reversibility:** trivial — set weights to zero to disable individual terms.
+**Worth Jakob reviewing first?** Already greenlit ("Option A").
+**Risk:** if D17 also fails, the fundamental conclusion is that no-GAN fine-tune cannot improve over the pretrained-streaming baseline for click metrics, and the project should accept Phase 1 streaming output as the deliverable until a discriminator-capable GPU is available.
+
 ## D16  Add waveform L1 loss; rebalance loss weights to suppress sample-level transients    [decided 2026-05-02]
 **Source:** Phase 2.4 audio review by Jakob: "_streaming_causal_finetuned WAV files have clicks." Diagnostic showed streaming==offline parity holds (5e-6 diff), so the clicks are in the fine-tuned weights themselves, not the streaming wrapper. Per-sample diff stats: max sample-to-sample jump went from 0.289 (pretrained streaming) -> 0.453 (finetuned streaming) -- a 56% increase. Network's pre-clamp magnitude (post-exp) max went from 0.30 (pretrained) -> 1.30-1.77 (across all fine-tuned checkpoints) without ever hitting the clamp(1e2) ceiling.
 **Root cause:** Without a GAN discriminator (D15), the only audio-quality supervision was mel L1 + STFT magnitude L1. Both losses are phase-invariant -- the model can satisfy them while producing time-domain transients that are perceptually clicks. The 45:1 mel-to-STFT weight ratio (matching upstream Vocos's training ratio, but upstream also had GAN losses) made the model overfit mel fidelity at the cost of waveform smoothness.

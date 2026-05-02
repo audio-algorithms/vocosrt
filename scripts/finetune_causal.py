@@ -156,9 +156,13 @@ class TrainConfig:
     lr_initial: float = 1e-4
     lr_final: float = 1e-5
     weight_decay: float = 0.01
-    mel_loss_weight: float = 15.0          # rebalanced from 45 (D16): without GAN, mel-dominated training produces sample transients
-    stft_loss_weight: float = 2.5          # rebalanced from 1.0 (D16): more weight on STFT magnitude to constrain spectral energy
-    waveform_loss_weight: float = 10.0     # NEW (D16): direct sample-level L1 to suppress click-producing transients
+    mel_loss_weight: float = 15.0
+    stft_loss_weight: float = 2.5
+    # Click-targeted losses (D17): wav_l2 penalizes outlier samples quadratically;
+    # diff_match aligns the model's first-derivative envelope to the target's,
+    # directly preventing sharper-than-natural transients (clicks).
+    waveform_l2_weight: float = 1000.0     # MSE; smoke test shows raw value ~0.005 -> contribution ~5 (mel contribution ~6)
+    diff_match_weight: float = 500.0       # first-difference L1 -- raw ~0.005 -> contribution ~2.5
     use_discriminators: bool = False       # DECISIONS.md D15
     precision: str = "bf16"                # "fp32" / "fp16" / "bf16"
     checkpoint_every: int = 2_500
@@ -351,7 +355,7 @@ def main() -> int:
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_count = 0
-    last_log_loss = {"mel": 0.0, "stft": 0.0, "wav": 0.0, "total": 0.0}
+    last_log_loss = {"mel": 0.0, "stft": 0.0, "wav_l2": 0.0, "diff": 0.0, "total": 0.0}
 
     while step < cfg.num_steps:
         try:
@@ -377,11 +381,18 @@ def main() -> int:
 
             mel_loss = mel_loss_fn(audio_hat, audio)
             stft_loss = stft_loss_fn(audio, audio_hat)
-            wav_loss = (audio - audio_hat).abs().mean()
+            # Waveform L2 -- penalize large per-sample errors quadratically
+            wav_l2 = (audio - audio_hat).pow(2).mean()
+            # First-difference matching -- model's d/dt should match target's d/dt;
+            # mismatch here is exactly what produces audible clicks
+            target_diff = audio[..., 1:] - audio[..., :-1]
+            output_diff = audio_hat[..., 1:] - audio_hat[..., :-1]
+            diff_match = (target_diff - output_diff).abs().mean()
             total_loss = (
                 cfg.mel_loss_weight * mel_loss
                 + cfg.stft_loss_weight * stft_loss
-                + cfg.waveform_loss_weight * wav_loss
+                + cfg.waveform_l2_weight * wav_l2
+                + cfg.diff_match_weight * diff_match
             )
             loss_for_backward = total_loss / cfg.grad_accum_steps
 
@@ -408,7 +419,8 @@ def main() -> int:
 
             last_log_loss["mel"] = float(mel_loss.detach())
             last_log_loss["stft"] = float(stft_loss.detach())
-            last_log_loss["wav"] = float(wav_loss.detach())
+            last_log_loss["wav_l2"] = float(wav_l2.detach())
+            last_log_loss["diff"] = float(diff_match.detach())
             last_log_loss["total"] = float(total_loss.detach())
 
             if step % cfg.log_every == 0:
@@ -417,9 +429,10 @@ def main() -> int:
                 steps_per_s = (step - start_step) / max(wall, 1e-3)
                 eta_h = (cfg.num_steps - step) / max(steps_per_s, 1e-3) / 3600.0
                 log.info(
-                    "step=%d/%d lr=%.2e mel=%.4f stft=%.4f wav=%.4f total=%.4f sps=%.2f eta_h=%.1f",
+                    "step=%d/%d lr=%.2e mel=%.4f stft=%.4f wav2=%.5f diff=%.5f total=%.4f sps=%.2f eta_h=%.1f",
                     step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["stft"],
-                    last_log_loss["wav"], last_log_loss["total"], steps_per_s, eta_h,
+                    last_log_loss["wav_l2"], last_log_loss["diff"],
+                    last_log_loss["total"], steps_per_s, eta_h,
                 )
 
             # Wall-clock budget check at regular intervals (after warmup so sps is stable)
@@ -471,8 +484,9 @@ def main() -> int:
         completion_marker.write_text(f"completed at step {step}\n")
 
     total_h = (time.time() - t_start) / 3600.0
-    log.info("DONE. wall-clock=%.2f h, final losses: mel=%.4f stft=%.4f wav=%.4f",
-             total_h, last_log_loss["mel"], last_log_loss["stft"], last_log_loss["wav"])
+    log.info("DONE. wall-clock=%.2f h, final losses: mel=%.4f stft=%.4f wav_l2=%.5f diff=%.5f",
+             total_h, last_log_loss["mel"], last_log_loss["stft"],
+             last_log_loss["wav_l2"], last_log_loss["diff"])
     return 0
 
 
