@@ -156,8 +156,9 @@ class TrainConfig:
     lr_initial: float = 1e-4
     lr_final: float = 1e-5
     weight_decay: float = 0.01
-    mel_loss_weight: float = 45.0          # standard weighting from upstream Vocos training
-    stft_loss_weight: float = 1.0
+    mel_loss_weight: float = 15.0          # rebalanced from 45 (D16): without GAN, mel-dominated training produces sample transients
+    stft_loss_weight: float = 2.5          # rebalanced from 1.0 (D16): more weight on STFT magnitude to constrain spectral energy
+    waveform_loss_weight: float = 10.0     # NEW (D16): direct sample-level L1 to suppress click-producing transients
     use_discriminators: bool = False       # DECISIONS.md D15
     precision: str = "bf16"                # "fp32" / "fp16" / "bf16"
     checkpoint_every: int = 2_500
@@ -350,7 +351,7 @@ def main() -> int:
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_count = 0
-    last_log_loss = {"mel": 0.0, "stft": 0.0, "total": 0.0}
+    last_log_loss = {"mel": 0.0, "stft": 0.0, "wav": 0.0, "total": 0.0}
 
     while step < cfg.num_steps:
         try:
@@ -376,7 +377,12 @@ def main() -> int:
 
             mel_loss = mel_loss_fn(audio_hat, audio)
             stft_loss = stft_loss_fn(audio, audio_hat)
-            total_loss = cfg.mel_loss_weight * mel_loss + cfg.stft_loss_weight * stft_loss
+            wav_loss = (audio - audio_hat).abs().mean()
+            total_loss = (
+                cfg.mel_loss_weight * mel_loss
+                + cfg.stft_loss_weight * stft_loss
+                + cfg.waveform_loss_weight * wav_loss
+            )
             loss_for_backward = total_loss / cfg.grad_accum_steps
 
         if use_scaler:
@@ -402,6 +408,7 @@ def main() -> int:
 
             last_log_loss["mel"] = float(mel_loss.detach())
             last_log_loss["stft"] = float(stft_loss.detach())
+            last_log_loss["wav"] = float(wav_loss.detach())
             last_log_loss["total"] = float(total_loss.detach())
 
             if step % cfg.log_every == 0:
@@ -410,9 +417,9 @@ def main() -> int:
                 steps_per_s = (step - start_step) / max(wall, 1e-3)
                 eta_h = (cfg.num_steps - step) / max(steps_per_s, 1e-3) / 3600.0
                 log.info(
-                    "step=%d/%d lr=%.2e mel=%.4f stft=%.4f total=%.4f sps=%.2f eta_h=%.1f",
+                    "step=%d/%d lr=%.2e mel=%.4f stft=%.4f wav=%.4f total=%.4f sps=%.2f eta_h=%.1f",
                     step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["stft"],
-                    last_log_loss["total"], steps_per_s, eta_h,
+                    last_log_loss["wav"], last_log_loss["total"], steps_per_s, eta_h,
                 )
 
             # Wall-clock budget check at regular intervals (after warmup so sps is stable)
@@ -464,8 +471,8 @@ def main() -> int:
         completion_marker.write_text(f"completed at step {step}\n")
 
     total_h = (time.time() - t_start) / 3600.0
-    log.info("DONE. wall-clock=%.2f h, final losses: mel=%.4f stft=%.4f",
-             total_h, last_log_loss["mel"], last_log_loss["stft"])
+    log.info("DONE. wall-clock=%.2f h, final losses: mel=%.4f stft=%.4f wav=%.4f",
+             total_h, last_log_loss["mel"], last_log_loss["stft"], last_log_loss["wav"])
     return 0
 
 

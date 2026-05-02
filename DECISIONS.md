@@ -103,6 +103,20 @@ Every non-trivial deviation from `prompt/CLAUDE_CODE_PROMPT_VOCOS_REALTIME.md`, 
 **Rationale:** Autonomous build cannot guarantee a microphone is present; synthetic-mel + virtual-loopback gives a deterministic, headless-runnable verdict. The four bundled WAVs (keyboard, music, noise, speech) are convenient diverse inputs.
 **Worth Jakob reviewing first?** No.
 
+## D16  Add waveform L1 loss; rebalance loss weights to suppress sample-level transients    [decided 2026-05-02]
+**Source:** Phase 2.4 audio review by Jakob: "_streaming_causal_finetuned WAV files have clicks." Diagnostic showed streaming==offline parity holds (5e-6 diff), so the clicks are in the fine-tuned weights themselves, not the streaming wrapper. Per-sample diff stats: max sample-to-sample jump went from 0.289 (pretrained streaming) -> 0.453 (finetuned streaming) -- a 56% increase. Network's pre-clamp magnitude (post-exp) max went from 0.30 (pretrained) -> 1.30-1.77 (across all fine-tuned checkpoints) without ever hitting the clamp(1e2) ceiling.
+**Root cause:** Without a GAN discriminator (D15), the only audio-quality supervision was mel L1 + STFT magnitude L1. Both losses are phase-invariant -- the model can satisfy them while producing time-domain transients that are perceptually clicks. The 45:1 mel-to-STFT weight ratio (matching upstream Vocos's training ratio, but upstream also had GAN losses) made the model overfit mel fidelity at the cost of waveform smoothness.
+**Decision:**
+1. Add a waveform L1 loss term: `(audio - audio_hat).abs().mean()`. Directly penalizes sample-level discontinuities.
+2. Rebalance: `mel_weight: 45 -> 15`, `stft_weight: 1 -> 2.5`, `waveform_weight: -> 10`. Ratios mel:stft:wav of 6:1:4 (vs the old 45:1:0).
+3. Restart training from scratch (not from a step_NNNNNN.pt) so the new loss can shape the optimization trajectory from step 0.
+**Rationale for rejecting alternatives:**
+- Use earlier checkpoint (step 5k or 35k): mag_max was already 1.30+ at step 5k -- the drift happens within the first 5k steps, so no early checkpoint is "clean" relative to pretrained.
+- Add discriminators: still doesn't fit on 4 GB (D15 still applies).
+- L2 weight regularization vs pretrained: would slow convergence without addressing the root cause.
+**Reversibility:** trivial -- the loss term is conditional on weight > 0; setting waveform_weight=0 reverts to D15-era training.
+**Worth Jakob reviewing first?** No (he flagged the issue and the fix follows directly from the root cause analysis).
+
 ## D15  Phase 2 fine-tune: reconstruction losses only (no GAN discriminators)           [decided 2026-05-01]
 **Source:** memory budget analysis (4 GB RTX 3050) + prompt §6 (which assumed 8 GB)
 **Decision:** Phase 2 fine-tune uses ONLY mel L1 reconstruction loss + multi-resolution STFT loss. The MPD + MRD discriminators from upstream Vocos training are NOT loaded. `--use-discriminators` flag exists but defaults to off; current 4 GB budget cannot accommodate generator + discriminators + optimizer + activations.
