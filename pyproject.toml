@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vocos_rt"
+version = "0.0.1"
+description = "Real-time streaming refactor of the Vocos neural vocoder"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Jakob Ashtar", email = "" }]
+license = { text = "Proprietary - Copyright (c) 2026 AudioAlgorithms LLC. All rights reserved." }
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "vocos>=0.1.0",
+    "onnxruntime-gpu>=1.17",
+    "onnx>=1.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=4",
+    "pytest-xdist>=3",
+    "pytest-timeout>=2",
+    "librosa>=0.10",
+    "torchcrepe>=0.0.22",
+    "pesq>=0.0.4",
+    "pystoi>=0.4",
+    "speechbrain>=1.0",
+    "mir_eval>=0.7",
+    "psutil>=5.9",
+    "mypy>=1.8",
+    "ruff>=0.5",
+    "soundfile>=0.12",
+    "sounddevice>=0.4",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+    "requests>=2.31",
+    "python-docx>=1.1",
+    "huggingface-hub>=0.20",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vocos_rt*"]
+exclude = ["tests*", "demos*", "scripts*", "docs*", "reports*", "third_party*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "C4", "UP", "SIM", "RUF"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["vocos.*", "torchcrepe.*", "speechbrain.*", "pesq.*", "pystoi.*", "mir_eval.*", "sounddevice.*", "librosa.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q --strict-markers --strict-config"
+markers = [
+    "slow: tests taking > 30 s",
+    "long: tests taking > 5 min (long-run stability, RTF, leak)",
+    "gpu: tests requiring CUDA",
+]

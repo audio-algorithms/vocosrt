@@ -1,0 +1,9 @@
+# Runtime dependencies. Pinned floor only; let pip resolve compatible upper bounds.
+# See pyproject.toml for the canonical declaration; this file exists for setup.bat / setup.sh consumption.
+
+torch>=2.2
+numpy>=1.26
+scipy>=1.11
+vocos>=0.1.0
+onnxruntime-gpu>=1.17
+onnx>=1.15

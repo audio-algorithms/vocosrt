@@ -1,0 +1,24 @@
+# Development / test / docs dependencies. Layered on top of requirements.txt.
+
+-r requirements.txt
+
+pytest>=8
+pytest-cov>=4
+pytest-xdist>=3
+pytest-timeout>=2
+librosa>=0.10
+torchcrepe>=0.0.22
+pesq>=0.0.4
+pystoi>=0.4
+speechbrain>=1.0
+mir_eval>=0.7
+psutil>=5.9
+mypy>=1.8
+ruff>=0.5
+soundfile>=0.12
+sounddevice>=0.4
+matplotlib>=3.8
+tqdm>=4.66
+requests>=2.31
+python-docx>=1.1
+huggingface-hub>=0.20
