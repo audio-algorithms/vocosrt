@@ -1,0 +1,12 @@
+{
+  "charactr/vocos-mel-24khz": {
+    ".cache/huggingface/.gitignore": "684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1",
+    ".cache/huggingface/CACHEDIR.TAG": "e8893e2dcb3f4545ef67a0a5b7b769113d38eef1aa61c7c7ba14659b02af955f",
+    ".cache/huggingface/download/README.md.metadata": "eb45514d3c16de6f620781957b26286a3cc0a00bfaeef09af47ce87412d0c345",
+    ".cache/huggingface/download/config.yaml.metadata": "568d41287609c0d1a66d3264f89198b8c6f8dd326dcfb6ed46f0bf6c79218b63",
+    ".cache/huggingface/download/pytorch_model.bin.metadata": "695933c9c74b61dd1130ae1d9e077ebf4dce25d3bb4fdc73879338e2029bfa67",
+    "README.md": "5858497d76d58914b29958a0f448e7b4fd3bb54940100baaa7520d4a56d8b3df",
+    "config.yaml": "da9033922f969a47f0c160010226919e59f27761fd5066f3828d46de6650b0fc",
+    "pytorch_model.bin": "97ec976ad1fd67a33ab2682d29c0ac7df85234fae875aefcc5fb215681a91b2a"
+  }
+}
