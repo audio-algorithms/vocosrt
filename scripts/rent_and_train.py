@@ -51,7 +51,21 @@ GITHUB_REPO_URL = "https://github.com/audio-algorithms/vocosrt.git"
 LOCAL_CHECKPOINT_DEST = REPO_ROOT / "checkpoints" / "finetune" / "final_remote.pt"
 LOCAL_LOG_DEST = REPO_ROOT / "checkpoints" / "finetune" / "training_remote.log"
 
-VAST_BIN = shutil.which("vastai") or shutil.which("vastai.exe")
+def _find_vastai_bin() -> str | None:
+    """Locate vastai binary. Look in PATH first, then alongside the current Python."""
+    found = shutil.which("vastai") or shutil.which("vastai.exe")
+    if found:
+        return found
+    # vastai installed in the same venv as this Python interpreter
+    py_dir = Path(sys.executable).parent
+    for candidate in [py_dir / "vastai.exe", py_dir / "vastai",
+                      py_dir / "Scripts" / "vastai.exe", py_dir / "Scripts" / "vastai"]:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+VAST_BIN: str | None = None  # populated by ensure_vastai_installed()
 
 
 # --------------------------------------------------------------- state
@@ -124,6 +138,7 @@ def scp_from_remote(host: str, port: int, remote_path: str, local_path: Path) ->
 
 def ensure_vastai_installed() -> None:
     global VAST_BIN
+    VAST_BIN = _find_vastai_bin()
     if VAST_BIN:
         return
     print("[setup] vastai CLI not found, installing via pip ...")
