@@ -36,7 +36,15 @@ class StreamingVocos(nn.Module):
     ``StreamingISTFT``; ``reset(batch_size)`` clears all of them.
     """
 
-    def __init__(self, upstream: vocos.Vocos):
+    def __init__(self, upstream: vocos.Vocos, lookahead_frames: int = 4):
+        """
+        Args:
+            upstream: loaded vocos.Vocos model
+            lookahead_frames: future-frame context allowed at the input embed
+                conv (D19 per architecture-agent: removes 60-80% of hop-rate
+                comb on pretrained weights). Authorized by the spec at L=4.
+                Default 4. Set to 0 for pure causal.
+        """
         super().__init__()
         backbone = upstream.backbone
         head = upstream.head
@@ -47,9 +55,13 @@ class StreamingVocos(nn.Module):
         self.n_fft: int = head.istft.n_fft
         self.hop_length: int = head.istft.hop_length
         self.win_length: int = head.istft.win_length
+        self.lookahead_frames: int = lookahead_frames
 
-        # Causalize the input embed conv (K=7, padding=3 -> padding=0 + ring buffer)
-        self.embed = StreamingCausalConv1d(backbone.embed)
+        # Causalize the input embed conv. Allow lookahead here (spec authorizes
+        # 4 frames). Per architecture-agent: distributing 4 frames at the input
+        # gives the WHOLE network 4 frames of mel context vs the previous
+        # all-causal model. Subsequent ConvNeXt blocks remain pure causal.
+        self.embed = StreamingCausalConv1d(backbone.embed, lookahead_frames=lookahead_frames)
 
         # First per-frame LayerNorm (shared with upstream module)
         self.input_norm = backbone.norm
@@ -103,8 +115,8 @@ class StreamingVocos(nn.Module):
 
     @property
     def algorithmic_latency_samples(self) -> int:
-        """ISTFT structural delay only (the ConvNeXt depth is causal, so no extra delay)."""
-        return self.istft.algorithmic_latency_samples
+        """ISTFT structural delay + input embed lookahead frames (each = hop_length samples)."""
+        return self.istft.algorithmic_latency_samples + self.lookahead_frames * self.hop_length
 
     @property
     def algorithmic_latency_ms(self) -> float:

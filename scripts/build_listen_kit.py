@@ -25,10 +25,10 @@ from vocos_rt.streaming_vocos import StreamingVocos  # noqa: E402
 
 WORKSPACE = Path(r"C:\Users\jakob\Desktop\google drive\VOCOSRT")
 INPUT_DIR = WORKSPACE / "audio"
-OUT_DIR = WORKSPACE / "audio_to_listen"
+OUT_DIR = WORKSPACE / "audio_to_listen_D18_step5k"
 SAMPLE_RATE = 24_000
 WARMUP_SKIP = SAMPLE_RATE // 10
-D17_CKPT = REPO_ROOT / "checkpoints" / "finetune" / "step_035000.pt"
+D17_CKPT = REPO_ROOT / "checkpoints" / "finetune" / "step_005000.pt"  # D18 step 5k (best available)
 
 # 3 picks: long (13s), medium (~5s, female), short (~1s, male)
 PICKS = [
@@ -100,7 +100,7 @@ def main() -> int:
         streaming_ft.reset(batch_size=1)
         af = streaming_ft.stream(mel)
         af = peak_normalize_to(audio, af, skip=WARMUP_SKIP)
-        save_wav(OUT_DIR / f"{prefix}__D_streaming_finetuned_D17_SHARPER.wav", af.cpu())
+        save_wav(OUT_DIR / f"{prefix}__D_streaming_D18_step5k_GAN.wav", af.cpu())
         print(f"  done: {prefix}")
 
     readme = OUT_DIR / "README.txt"

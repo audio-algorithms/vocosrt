@@ -160,6 +160,71 @@ def crest_factor(audio: Tensor) -> float:
     return peak / max(rms, 1e-9)
 
 
+# --------------------------------------------------------------- tube / comb-filter metric
+
+
+def hop_rate_ripple_db(
+    audio: Tensor,
+    reference: Tensor,
+    sample_rate: int = 24_000,
+    hop_length: int = 256,
+    envelope_window_samples: int = 192,  # ~8 ms at 24 kHz
+    envelope_hop_samples: int = 64,
+) -> float:
+    """Detect 'tube'/comb-filter artifact at the hop rate.
+
+    Per adversarial agent: causal masking + constant OLA normalization leaks
+    frame-correlated mag/phase errors as a periodic ripple at the hop rate
+    (=24000/256 = 93.75 Hz). Periodic gain ripple in time = comb filter in
+    frequency = 'tube' sound.
+
+    Method: take the log-magnitude envelope of (audio / reference), DFT it,
+    measure the SNR at the hop frequency vs. the median of neighboring bins.
+
+    Returns SNR in dB at the hop frequency. Clean speech: < 3 dB. Tube: > 10 dB.
+    """
+    n = min(audio.shape[-1], reference.shape[-1])
+    a = audio[..., :n].squeeze() if audio.dim() > 1 else audio[..., :n]
+    r = reference[..., :n].squeeze() if reference.dim() > 1 else reference[..., :n]
+
+    # Sliding RMS for both
+    a2 = a.pow(2)
+    r2 = r.pow(2)
+    if a2.shape[-1] < envelope_window_samples * 4:
+        return 0.0
+    a_frames = a2.unfold(-1, envelope_window_samples, envelope_hop_samples)
+    r_frames = r2.unfold(-1, envelope_window_samples, envelope_hop_samples)
+    a_env = a_frames.mean(dim=-1).sqrt().clamp(min=1e-7).log()  # (n_frames,)
+    r_env = r_frames.mean(dim=-1).sqrt().clamp(min=1e-7).log()
+    ratio = a_env - r_env  # log-ratio; should be roughly constant if no comb
+    ratio = ratio - ratio.mean()  # remove DC
+
+    # Sample rate of the envelope signal
+    env_sample_rate = sample_rate / envelope_hop_samples  # 24000/64 = 375 Hz
+    hop_rate_hz = sample_rate / hop_length                # 24000/256 = 93.75 Hz
+
+    # FFT of the envelope
+    n_fft = ratio.shape[-1]
+    spec = torch.fft.rfft(ratio, n=n_fft).abs()
+    freqs = torch.fft.rfftfreq(n_fft, d=1.0 / env_sample_rate)
+
+    # Find the bin closest to hop_rate_hz
+    hop_bin = int(torch.argmin((freqs - hop_rate_hz).abs()))
+    if hop_bin < 3 or hop_bin >= len(spec) - 3:
+        return 0.0
+
+    # SNR: amplitude at hop bin vs median of neighboring bins (excluding immediate neighbors)
+    neighbor_lo = max(1, hop_bin - 10)
+    neighbor_hi = min(len(spec) - 1, hop_bin + 10)
+    neighborhood = torch.cat([spec[neighbor_lo:hop_bin - 2], spec[hop_bin + 3:neighbor_hi]])
+    if neighborhood.numel() == 0:
+        return 0.0
+    noise_floor = float(neighborhood.median().clamp(min=1e-12))
+    peak_amp = float(spec[hop_bin].clamp(min=1e-12))
+    snr_db = 20.0 * (torch.tensor(peak_amp / noise_floor)).log10().item()
+    return snr_db
+
+
 # --------------------------------------------------------------- bundle
 
 
@@ -179,7 +244,79 @@ def all_metrics(audio: Tensor, reference: Tensor | None = None,
     if reference is not None:
         out["log_mel_l1_vs_ref"] = log_mel_l1_vs_reference(audio, reference, sample_rate)
         out["spectral_centroid_drift_hz"] = spectral_centroid_drift(audio, reference, sample_rate)
+        out["hop_rate_ripple_db"] = hop_rate_ripple_db(audio, reference, sample_rate)
     return out
+
+
+def hop_rate_envelope_flatness_loss(
+    audio_hat: Tensor,
+    audio_real: Tensor,
+    sample_rate: int = 24_000,
+    hop_length: int = 256,
+    env_window_samples: int = 192,
+    env_hop_samples: int = 64,
+    n_neighbor_bins: int = 1,
+) -> Tensor:
+    """Differentiable training loss: penalize hop-rate periodic ripple in the
+    log-power-envelope ratio (audio_hat / audio_real).
+
+    Targets the comb-filter ("tube") artifact directly. Per the DSP-specialist
+    review: the hop-rate ripple is a frame-correlated mag/phase error pattern
+    that mel/STFT-magnitude losses are blind to; this loss penalizes it
+    explicitly in the modulation domain.
+
+    Returns a scalar loss value. Differentiable through unfold, log, and FFT.
+    Forced fp32 internally for numerical stability of the FFT peak read.
+
+    Args:
+        audio_hat: (B, T) generator output
+        audio_real: (B, T) ground truth
+        sample_rate: input sample rate (default 24000 → hop rate 93.75 Hz)
+        hop_length: STFT hop in samples
+        env_window_samples: sliding-RMS window for envelope extraction
+        env_hop_samples: sliding-RMS hop
+        n_neighbor_bins: how many FFT bins around hop_rate to include in the penalty
+    """
+    # Force fp32 -- bf16 FFT precision is poor at low magnitudes and can hide
+    # the hop-rate peak we're trying to penalize.
+    a = audio_hat.float()
+    r = audio_real.float()
+    n = min(a.shape[-1], r.shape[-1])
+    a = a[..., :n]
+    r = r[..., :n]
+
+    if a.shape[-1] < env_window_samples * 8:  # need at least a few env frames for FFT
+        return torch.zeros((), device=audio_hat.device, dtype=audio_hat.dtype)
+
+    # Sliding RMS via unfold
+    a2 = a.pow(2)
+    r2 = r.pow(2)
+    a_frames = a2.unfold(-1, env_window_samples, env_hop_samples)  # (..., n_env, win)
+    r_frames = r2.unfold(-1, env_window_samples, env_hop_samples)
+    a_env = a_frames.mean(dim=-1).clamp(min=1e-7)
+    r_env = r_frames.mean(dim=-1).clamp(min=1e-7)
+
+    # Log-ratio (per-element); subtract per-sample mean so DC doesn't leak in
+    ratio = a_env.log() - r_env.log()
+    ratio = ratio - ratio.mean(dim=-1, keepdim=True)
+
+    # FFT the envelope ratio
+    n_fft_env = ratio.shape[-1]
+    spec = torch.fft.rfft(ratio, n=n_fft_env, dim=-1).abs()
+
+    # Sample rate of the envelope signal & target hop-rate bin
+    env_sr = sample_rate / env_hop_samples              # 24000/64 = 375 Hz
+    hop_rate_hz = sample_rate / hop_length               # 24000/256 = 93.75 Hz
+    freq_bin_size = env_sr / n_fft_env
+    hop_bin = int(round(hop_rate_hz / freq_bin_size))
+    if hop_bin < 1 or hop_bin >= spec.shape[-1] - 1:
+        return torch.zeros((), device=audio_hat.device, dtype=audio_hat.dtype)
+
+    lo = max(1, hop_bin - n_neighbor_bins)
+    hi = min(spec.shape[-1], hop_bin + n_neighbor_bins + 1)
+    # Penalize the squared magnitude (energy) at the hop-rate bin
+    loss = spec[..., lo:hi].pow(2).mean()
+    return loss.to(audio_hat.dtype)
 
 
 __all__ = [
@@ -187,6 +324,8 @@ __all__ = [
     "clip_count",
     "crest_factor",
     "dc_offset",
+    "hop_rate_envelope_flatness_loss",
+    "hop_rate_ripple_db",
     "jump_count_above",
     "jumps_per_second",
     "log_mel_l1_vs_reference",

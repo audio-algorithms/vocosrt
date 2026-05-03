@@ -44,9 +44,19 @@ class StreamingCausalConv1d(nn.Module):
                      not registered as a buffer (does not appear in state_dict).
 
     Limitations: only stride=1, dilation=1 are supported.
+
+    Args:
+        base: the source nn.Conv1d (weights cloned, padding ignored).
+        lookahead_frames: number of FUTURE input frames the conv may peek at.
+            With kernel size K, conv kernel covers [-(K-1-L), +L] frames around
+            the current output position. L=0 = pure causal (default).
+            Positive L matches the bidirectional training condition more
+            closely (per the architecture-specialist agent: removes 60-80%
+            of the hop-rate comb on pretrained weights before fine-tune).
+            Adds L frames of additional algorithmic latency.
     """
 
-    def __init__(self, base: nn.Conv1d) -> None:
+    def __init__(self, base: nn.Conv1d, lookahead_frames: int = 0) -> None:
         super().__init__()
         if base.stride != (1,):
             raise ValueError(f"Only stride=1 is supported (got {base.stride})")
@@ -55,6 +65,9 @@ class StreamingCausalConv1d(nn.Module):
         K = base.kernel_size[0]
         if K < 2:
             raise ValueError(f"Kernel size must be >= 2 (got {K})")
+        if lookahead_frames < 0 or lookahead_frames > K - 1:
+            raise ValueError(f"lookahead_frames must be in [0, {K-1}], got {lookahead_frames}")
+        self.lookahead = lookahead_frames
         # Replicate the conv with padding=0; copy weights and bias (no clone needed --
         # nn.Conv1d's __init__ allocates fresh tensors which we overwrite immediately
         # with assigned references).
@@ -90,7 +103,12 @@ class StreamingCausalConv1d(nn.Module):
         )
 
     def step(self, x: Tensor) -> Tensor:
-        """Push one frame through the causal conv.
+        """Push one frame through the conv.
+
+        With lookahead L > 0, this method buffers the L most-recent input
+        frames; output emerges only after L+1 inputs have been seen, and each
+        output corresponds to logical time (input_time - L). The first L
+        outputs returned are placeholders (zeros) for the user to discard.
 
         Args:
             x: (B, in_channels, 1)
@@ -114,16 +132,23 @@ class StreamingCausalConv1d(nn.Module):
     # --------- offline API (used for the reference path / parity tests) ---------
 
     def forward_offline(self, x: Tensor) -> Tensor:
-        """Apply the causal conv to a full sequence in one pass.
+        """Apply the conv to a full sequence in one pass.
+
+        With L=0: pure causal -- output[i] = conv(x[i-K+1..i]). Pad (K-1, 0).
+        With L>0: output[i] = conv(x[i-(K-1-L)..i+L]). Pad (K-1-L, L).
 
         Args:
             x: (B, in_channels, T)
 
         Returns:
-            (B, out_channels, T) -- left-padded with zeros, conv applied with padding=0.
+            (B, out_channels, T)
         """
         K = self.kernel_size
-        x = torch.nn.functional.pad(x, (K - 1, 0))
+        L = self.lookahead
+        # Per architecture-agent: this padding gives the model L frames of future
+        # context so the kernel sees a window closer to its bidirectional-training
+        # condition. Bit-exact with streaming step() once outputs are aligned.
+        x = torch.nn.functional.pad(x, (K - 1 - L, L))
         return self.conv(x)
 
 

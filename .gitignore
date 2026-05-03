@@ -35,6 +35,9 @@ checkpoints/*.bin
 checkpoints/*.safetensors
 checkpoints/*.ckpt
 checkpoints/*.onnx
+# Backup checkpoints (e.g. step_005000.pt.d15 from D15 attempt) and crash backups
+checkpoints/**/*.pt.*
+checkpoints/**/*.bin.*
 !checkpoints/.gitkeep
 !checkpoints/manifest.json
 # Generated audio outputs

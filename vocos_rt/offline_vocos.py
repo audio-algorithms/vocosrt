@@ -37,7 +37,13 @@ from vocos_rt.causal_conv import StreamingCausalConv1d, StreamingCausalConvNeXtB
 class OfflineVocos(nn.Module):
     """Full-sequence causal Vocos. Same weights and math as ``StreamingVocos``."""
 
-    def __init__(self, upstream: vocos.Vocos):
+    def __init__(self, upstream: vocos.Vocos, lookahead_frames: int = 4):
+        """
+        Args:
+            upstream: loaded vocos.Vocos model.
+            lookahead_frames: future-frame context at the input embed (D19).
+                Must match StreamingVocos's value for bit-exactness.
+        """
         super().__init__()
         backbone = upstream.backbone
         head = upstream.head
@@ -47,11 +53,12 @@ class OfflineVocos(nn.Module):
         self.n_fft: int = head.istft.n_fft
         self.hop_length: int = head.istft.hop_length
         self.win_length: int = head.istft.win_length
+        self.lookahead_frames: int = lookahead_frames
 
         # Same causal modules as StreamingVocos (reuses the StreamingCausalConv1d
         # constructor that clones the upstream weights). We use the .forward_offline
         # methods below instead of .step.
-        self.embed = StreamingCausalConv1d(backbone.embed)
+        self.embed = StreamingCausalConv1d(backbone.embed, lookahead_frames=lookahead_frames)
         self.input_norm = backbone.norm
         self.blocks = nn.ModuleList(
             [StreamingCausalConvNeXtBlock(blk) for blk in backbone.convnext]

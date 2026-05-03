@@ -56,6 +56,7 @@ warnings.filterwarnings("ignore")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from vocos_rt.distortion_metrics import hop_rate_envelope_flatness_loss  # noqa: E402
 from vocos_rt.forensic_log import log  # noqa: E402
 from vocos_rt.offline_vocos import OfflineVocos  # noqa: E402
 
@@ -164,14 +165,18 @@ class TrainConfig:
     # Loss weights -- different defaults for GAN vs reconstruction-only training.
     # When use_discriminators=True, follow upstream Vocos's recipe: mel=45 + adv + fm.
     # When False, use D17-era reconstruction-only fallback weights.
-    mel_loss_weight: float = 45.0          # upstream default for GAN training
-    stft_loss_weight: float = 0.0          # disabled when GAN is active (adv handles spectrum)
-    waveform_l2_weight: float = 0.0        # disabled when GAN is active
-    diff_match_weight: float = 0.0         # disabled when GAN is active
+    mel_loss_weight: float = 20.0          # D19: GAN-agent rebalanced from 45 (mel-floor was pinning quality)
+    stft_loss_weight: float = 0.0
+    waveform_l2_weight: float = 0.0
+    diff_match_weight: float = 0.0
+    envelope_flatness_weight: float = 5.0  # D19: hop-rate envelope flatness loss (tube/comb attack)
+    fm_weight: float = 2.0                 # D19: GAN-agent uplift from 1 (fm is the early-training ladder)
     mrd_loss_coeff: float = 1.0            # upstream default
     use_discriminators: bool = False       # see DECISIONS.md D18
-    disc_warmup_steps: int = 2_000         # train mel-only for first N steps; then enable disc
+    disc_warmup_steps: int = 5_000         # D19: GAN-agent recommendation; let mel converge before adv
     grad_checkpoint_generator: bool = True # save activation memory at the cost of recompute
+    detach_fmap_real: bool = True          # D19: Memory-agent's biggest single win (~400 MB)
+    drop_mpd_high_periods: bool = True     # D19: Memory-agent drop periods 7,11 (~150 MB)
     precision: str = "bf16"                # "fp32" / "fp16" / "bf16"
     checkpoint_every: int = 2_500
     validate_every: int = 2_500
@@ -241,13 +246,16 @@ def main() -> int:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--use-discriminators", action="store_true")
-    parser.add_argument("--disc-warmup-steps", type=int, default=2_000,
+    parser.add_argument("--disc-warmup-steps", type=int, default=5_000,
                         help="Train mel-only for N steps before enabling discriminators (avoids early instability)")
-    parser.add_argument("--mel-loss-weight", type=float, default=45.0)
+    parser.add_argument("--mel-loss-weight", type=float, default=20.0)
+    parser.add_argument("--fm-weight", type=float, default=2.0)
     parser.add_argument("--stft-loss-weight", type=float, default=0.0)
     parser.add_argument("--waveform-l2-weight", type=float, default=0.0)
     parser.add_argument("--diff-match-weight", type=float, default=0.0)
     parser.add_argument("--mrd-loss-coeff", type=float, default=1.0)
+    parser.add_argument("--envelope-flatness-weight", type=float, default=5.0,
+                        help="D19: hop-rate envelope flatness loss weight (direct tube/comb attack)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wall-clock-budget-h", type=float, default=60.0)
     parser.add_argument("--smoke-test", action="store_true",
@@ -268,6 +276,8 @@ def main() -> int:
         stft_loss_weight=args.stft_loss_weight,
         waveform_l2_weight=args.waveform_l2_weight,
         diff_match_weight=args.diff_match_weight,
+        envelope_flatness_weight=args.envelope_flatness_weight,
+        fm_weight=args.fm_weight,
         mrd_loss_coeff=args.mrd_loss_coeff,
         checkpoint_every=args.checkpoint_every,
         validate_every=args.validate_every,
@@ -337,8 +347,21 @@ def main() -> int:
     if cfg.use_discriminators:
         from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
         log.info("constructing MPD + MRD discriminators ...")
-        mpd = MultiPeriodDiscriminator().to(device)
+        # D19: drop MPD periods 7,11 per memory-agent for ~150 MB activation savings
+        mpd_periods = (2, 3, 5) if cfg.drop_mpd_high_periods else (2, 3, 5, 7, 11)
+        log.info("MPD periods: %s", mpd_periods)
+        mpd = MultiPeriodDiscriminator(periods=mpd_periods).to(device)
         mrd = MultiResolutionDiscriminator().to(device)
+        # D19: checkpoint MPD sub-disc forwards per memory-agent (~200 MB savings)
+        for sub in mpd.discriminators:
+            orig_fn = sub.forward
+            def make_ckpt(fn):
+                def wrapped(x, cond_embedding_id=None):
+                    if torch.is_grad_enabled() and x.requires_grad:
+                        return torch.utils.checkpoint.checkpoint(fn, x, cond_embedding_id, use_reentrant=False)
+                    return fn(x, cond_embedding_id)
+                return wrapped
+            sub.forward = make_ckpt(orig_fn)
         mpd.train()
         mrd.train()
         n_mpd = sum(p.numel() for p in mpd.parameters())
@@ -482,14 +505,36 @@ def main() -> int:
             else:
                 diff_match = torch.zeros((), device=device)
 
+            # D19: hop-rate envelope flatness -- direct attack on the comb-filter "tube"
+            # artifact. Penalizes 93.75 Hz periodic ripple in (audio_hat/audio_real)
+            # log-envelope, which is the fingerprint of frame-correlated mag/phase
+            # errors that mel/STFT losses cannot see.
+            if cfg.envelope_flatness_weight > 0:
+                env_flat = hop_rate_envelope_flatness_loss(
+                    audio_hat, audio,
+                    sample_rate=SAMPLE_RATE, hop_length=256,
+                )
+            else:
+                env_flat = torch.zeros((), device=device)
+
             # Adversarial + feature matching (when disc active)
             if disc_active:
                 assert mpd is not None and mrd is not None
                 assert gen_adv_loss_fn is not None and fm_loss_fn is not None
-                # Crop disc inputs to relieve peak memory (D18 fix per agent)
                 audio_d_g, audio_hat_d_g = _crop_for_disc(audio, audio_hat)
-                _, fake_mp_g, fmap_r_mp, fmap_g_mp = mpd(audio_d_g, audio_hat_d_g)
-                _, fake_mrd_g, fmap_r_mrd, fmap_g_mrd = mrd(audio_d_g, audio_hat_d_g)
+                # D19 (memory-agent biggest win): for FM loss, the real-side fmaps
+                # are constants (target). Forward them under no_grad so the
+                # autograd graph through MPD/MRD only retains the fake-side path.
+                # Saves ~400 MB peak.
+                if cfg.detach_fmap_real:
+                    with torch.no_grad():
+                        _, _, fmap_r_mp, _ = mpd(audio_d_g, audio_d_g)
+                        _, _, fmap_r_mrd, _ = mrd(audio_d_g, audio_d_g)
+                    _, fake_mp_g, _, fmap_g_mp = mpd(audio_d_g, audio_hat_d_g)
+                    _, fake_mrd_g, _, fmap_g_mrd = mrd(audio_d_g, audio_hat_d_g)
+                else:
+                    _, fake_mp_g, fmap_r_mp, fmap_g_mp = mpd(audio_d_g, audio_hat_d_g)
+                    _, fake_mrd_g, fmap_r_mrd, fmap_g_mrd = mrd(audio_d_g, audio_hat_d_g)
                 loss_adv_mp, list_adv_mp = gen_adv_loss_fn(fake_mp_g)
                 loss_adv_mrd, list_adv_mrd = gen_adv_loss_fn(fake_mrd_g)
                 loss_adv_mp = loss_adv_mp / max(len(list_adv_mp), 1)
@@ -504,8 +549,9 @@ def main() -> int:
                 + cfg.stft_loss_weight * stft_loss
                 + cfg.waveform_l2_weight * wav_l2
                 + cfg.diff_match_weight * diff_match
+                + cfg.envelope_flatness_weight * env_flat
                 + loss_adv_mp + cfg.mrd_loss_coeff * loss_adv_mrd
-                + loss_fm_mp + cfg.mrd_loss_coeff * loss_fm_mrd
+                + cfg.fm_weight * (loss_fm_mp + cfg.mrd_loss_coeff * loss_fm_mrd)
             )
             loss_for_backward = total_loss / cfg.grad_accum_steps
 
@@ -534,6 +580,7 @@ def main() -> int:
             step += 1
 
             last_log_loss["mel"] = float(mel_loss.detach())
+            last_log_loss["envf"] = float(env_flat.detach())
             last_log_loss["total"] = float(total_loss.detach())
             if disc_active:
                 last_log_loss["adv_mp"] = float(loss_adv_mp.detach())
@@ -548,8 +595,8 @@ def main() -> int:
                 eta_h = (cfg.num_steps - step) / max(steps_per_s, 1e-3) / 3600.0
                 if disc_active:
                     log.info(
-                        "step=%d/%d lr=%.2e mel=%.4f advMP=%.3f advMR=%.3f fmMP=%.3f fmMR=%.3f dMP=%.3f dMR=%.3f total=%.2f sps=%.2f eta_h=%.1f",
-                        step, cfg.num_steps, lr, last_log_loss["mel"],
+                        "step=%d/%d lr=%.2e mel=%.4f envf=%.5f advMP=%.3f advMR=%.3f fmMP=%.3f fmMR=%.3f dMP=%.3f dMR=%.3f total=%.2f sps=%.2f eta_h=%.1f",
+                        step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["envf"],
                         last_log_loss.get("adv_mp", 0), last_log_loss.get("adv_mrd", 0),
                         last_log_loss.get("fm_mp", 0), last_log_loss.get("fm_mrd", 0),
                         last_log_loss.get("d_mp", 0), last_log_loss.get("d_mrd", 0),
@@ -557,9 +604,9 @@ def main() -> int:
                     )
                 else:
                     log.info(
-                        "step=%d/%d lr=%.2e mel=%.4f total=%.4f (mel-warmup) sps=%.2f eta_h=%.1f",
-                        step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["total"],
-                        steps_per_s, eta_h,
+                        "step=%d/%d lr=%.2e mel=%.4f envf=%.5f total=%.4f (mel-warmup) sps=%.2f eta_h=%.1f",
+                        step, cfg.num_steps, lr, last_log_loss["mel"], last_log_loss["envf"],
+                        last_log_loss["total"], steps_per_s, eta_h,
                     )
 
             # Wall-clock budget check at regular intervals (after warmup so sps is stable)
